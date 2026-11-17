@@ -20,9 +20,19 @@ function privateIp(ip) {
   return true;
 }
 
+function forceHttp(value) {
+  const url = new URL(value);
+  if (url.protocol === 'https:') {
+    url.protocol = 'http:';
+    if (url.port === '443') url.port = '';
+  }
+  if (url.protocol !== 'http:') throw new Error('Este proxy aceita somente origens Xtream HTTP.');
+  return url;
+}
+
 async function assertPublic(url) {
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
-    throw new Error('URL de mídia inválida.');
+  if (url.protocol !== 'http:' || url.username || url.password) {
+    throw new Error('URL de mídia inválida: o proxy Xtream exige HTTP sem credenciais embutidas no host.');
   }
   const host = url.hostname.toLowerCase();
   if (host === 'localhost' || host.endsWith('.local')) throw new Error('Host local bloqueado.');
@@ -30,28 +40,13 @@ async function assertPublic(url) {
   if (!ips.length || ips.some(x => privateIp(x.address))) throw new Error('Host privado bloqueado.');
 }
 
-function alternateProtocol(url) {
-  const alternate = new URL(url);
-  if (url.protocol === 'http:' && (!url.port || url.port === '80')) {
-    alternate.protocol = 'https:';
-    alternate.port = '';
-    return alternate;
-  }
-  if (url.protocol === 'https:' && (!url.port || url.port === '443')) {
-    alternate.protocol = 'http:';
-    alternate.port = '';
-    return alternate;
-  }
-  return null;
-}
-
 function tokenUrl(url, exp) {
-  return `/api/proxy?t=${encodeURIComponent(encode({ url, exp }))}`;
+  return `/api/proxy?t=${encodeURIComponent(encode({ url: forceHttp(url).toString(), exp }))}`;
 }
 
 function rewritePlaylist(text, baseUrl, exp) {
   const absolute = value => {
-    try { return new URL(value.trim(), baseUrl).toString(); } catch { return ''; }
+    try { return forceHttp(new URL(value.trim(), baseUrl)).toString(); } catch { return ''; }
   };
   return text.split(/\r?\n/).map(line => {
     const trimmed = line.trim();
@@ -75,22 +70,24 @@ function setStreamError(res, message) {
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Accept, Range, If-Range, User-Agent, Cache-Control, Pragma, Icy-MetaData');
   res.setHeader('Access-Control-Expose-Headers', 'X-Stream-Error, Content-Range, Accept-Ranges');
-  if (!['GET', 'HEAD'].includes(req.method)) return res.status(405).end('Use GET or HEAD.');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Este proxy usa somente GET.' });
 
   let controller;
   try {
     const payload = decode(req.query?.t);
-    let current = new URL(payload.url);
+    let current = forceHttp(payload.url);
     const requestedRange = req.headers.range;
     let range = requestedRange;
-    let originalOrigin = current.origin;
-    let originalReferer = current.toString();
-    let protocolRetryUsed = false;
+    const originalOrigin = current.origin;
+    const originalReferer = current.toString();
     const isPlaylist = /\.m3u8(?:$|\?)/i.test(current.href);
     const isMp4Like = /\.(mp4|m4v|mov|mkv)(?:$|\?)/i.test(current.href);
 
-    if (!isPlaylist && isMp4Like && req.method !== 'HEAD') {
+    if (!isPlaylist && isMp4Like) {
       const m = requestedRange && requestedRange.match(/^bytes=(\d+)-(\d*)$/);
       if (requestedRange && !m) return res.status(416).end('Invalid Range.');
       const start = m ? Number(m[1]) : 0;
@@ -107,30 +104,20 @@ module.exports = async function handler(req, res) {
       const headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         Accept: '*/*',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache',
+        Origin: current.origin,
         Referer: current.origin === originalOrigin ? originalReferer : `${current.origin}/`
       };
       if (range) headers.Range = range;
       if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-      try {
-        upstream = await fetch(current, { method: req.method, headers, redirect: 'manual', signal: controller.signal });
-      } catch (error) {
-        if ((error.cause?.code || error.code) !== 'ECONNREFUSED' || protocolRetryUsed) throw error;
-        const alternate = alternateProtocol(current);
-        if (!alternate) throw error;
-        await assertPublic(alternate);
-        protocolRetryUsed = true;
-        current = alternate;
-        originalOrigin = current.origin;
-        originalReferer = current.toString();
-        headers.Referer = originalReferer;
-        upstream = await fetch(current, { method: req.method, headers, redirect: 'manual', signal: controller.signal });
-      }
+      // Xtream/origem: sempre GET por HTTP; sem HEAD e sem retry HTTPS.
+      upstream = await fetch(current, { method: 'GET', headers, redirect: 'manual', signal: controller.signal });
       if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
       const location = upstream.headers.get('location');
       if (!location) throw new Error('O host de mídia enviou um redirecionamento sem destino.');
-      current = new URL(location, current);
+      current = forceHttp(new URL(location, current));
       if (hops === 5) throw new Error('O host de mídia excedeu o limite de redirecionamentos.');
     }
     if (!upstream) throw new Error('O provedor não respondeu.');
@@ -150,7 +137,7 @@ module.exports = async function handler(req, res) {
       return res.status(502).json({ error: message });
     }
 
-    if (playlist && req.method !== 'HEAD') {
+    if (playlist) {
       const body = await upstream.text();
       if (!body.trim()) {
         const message = 'O provedor devolveu uma playlist HLS vazia.';
@@ -171,7 +158,7 @@ module.exports = async function handler(req, res) {
     }
 
     if (/text\/html|application\/(?:json|xml)|text\/xml/i.test(type)) {
-      const body = req.method === 'HEAD' ? '' : await upstream.text();
+      const body = await upstream.text();
       const blocked = /forbidden|access denied|unauthorized|cloudflare|error 403/i.test(body.slice(0, 2000));
       const message = blocked
         ? 'O provedor devolveu uma página de bloqueio no lugar do segmento de vídeo.'
@@ -192,17 +179,17 @@ module.exports = async function handler(req, res) {
       if (value) res.setHeader(name, value);
     }
     if (isMp4Like) res.setHeader('Accept-Ranges', 'bytes');
-    if (req.method === 'HEAD' || !upstream.body) return res.end();
+    if (!upstream.body) return res.end();
     await pipeline(Readable.fromWeb(upstream.body), res);
   } catch (e) {
     if (res.headersSent || res.writableEnded) return;
     const missingSecret = e.message.includes('STREAM_PROXY_SECRET');
     const connection = e.cause?.code || e.code;
     const message = missingSecret ? e.message : connection === 'ECONNREFUSED'
-      ? 'CONNECTION_REFUSED: o host/porta do stream recusou a conexão até pela Vercel. Confirme com o provedor o endereço de mídia e se o servidor está ativo.'
-      : e.name === 'TimeoutError' ? 'O host de mídia não respondeu dentro do tempo limite.'
-      : e.message.includes('Host privado') || e.message.includes('Host local') ? e.message
-      : 'Não foi possível buscar o stream no provedor. Confira o endereço de mídia e a conectividade do servidor.';
+      ? 'CONNECTION_REFUSED: a origem HTTP recusou a conexão da Vercel. Confirme o host e a porta HTTP Xtream com o provedor.'
+      : e.name === 'TimeoutError' ? 'O host de mídia HTTP não respondeu dentro do tempo limite.'
+      : e.message.includes('Host privado') || e.message.includes('Host local') || e.message.includes('somente origens Xtream HTTP') ? e.message
+      : 'Não foi possível buscar o stream HTTP no provedor. Confira o endereço de mídia e a conectividade do servidor.';
     setStreamError(res, message);
     return res.status(502).json({ error: message });
   }
