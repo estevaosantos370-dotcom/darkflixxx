@@ -49,7 +49,7 @@ module.exports = async function handler(req, res) {
     base.pathname = `${prefix}/${kind}/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.${ext}`;
     base.search = '';
     const token = encode({ url: base.toString(), exp: Date.now() + 2 * 60 * 60 * 1000 });
-    return res.status(200).json({ url: `/api/stream?t=${encodeURIComponent(token)}` });
+    return res.status(200).json({ url: `/api/proxy?t=${encodeURIComponent(token)}` });
   } catch (e) {
     const message = e.message.includes('STREAM_PROXY_SECRET') ? e.message : 'Não foi possível preparar o stream. Verifique a conexão com o host do provedor.';
     return res.status(502).json({ error: message });
