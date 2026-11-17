@@ -17,13 +17,10 @@ function privateIp(ip) {
   return true;
 }
 
-function forceHttp(value) {
+function normalizeProtocol(value) {
   const url = new URL(value);
-  if (url.protocol === 'https:') {
-    url.protocol = 'http:';
-    if (url.port === '443') url.port = '';
-  }
-  if (url.protocol !== 'http:') throw new Error('XTREAM_HOST precisa usar HTTP.');
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('XTREAM_HOST precisa usar HTTP ou HTTPS.');
+  if (url.username || url.password) throw new Error('XTREAM_HOST não deve conter credenciais na URL.');
   return url;
 }
 
@@ -53,8 +50,8 @@ module.exports = async function handler(req, res) {
     if (!['movie', 'series', 'live'].includes(kind) || !/^\d{1,20}$/.test(id) || !/^[a-zA-Z0-9]{1,10}$/.test(ext))
       return res.status(400).json({ error: 'Tipo, ID ou formato do stream inválido.' });
     if (host.length > 400 || username.length > 180 || password.length > 180) return res.status(400).json({ error: 'Campo excede o limite permitido.' });
-    const base = forceHttp(host.trim());
-    if (base.search || base.hash || base.username || base.password) return res.status(400).json({ error: 'Informe somente o endereço-base HTTP do provedor.' });
+    const base = normalizeProtocol(host.trim());
+    if (base.search || base.hash) return res.status(400).json({ error: 'Informe somente o endereço-base do provedor, sem query ou fragmento.' });
     await assertPublic(base);
     const prefix = base.pathname.replace(/\/$/, '');
     base.pathname = `${prefix}/${kind}/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.${ext}`;
@@ -63,7 +60,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ url: `/api/proxy?t=${encodeURIComponent(token)}` });
   } catch (e) {
     const message = e.message.includes('STREAM_PROXY_SECRET') || e.message.includes('HTTP') ? e.message :
-      'Não foi possível preparar o stream HTTP. Verifique o host/porta e as variáveis privadas da Vercel.';
+      'Não foi possível preparar o stream. Verifique o host/porta e as variáveis privadas da Vercel.';
     return res.status(502).json({ error: message });
   }
 };
