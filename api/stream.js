@@ -3,7 +3,7 @@ const net = require('node:net');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { decode, encode } = require('../lib/stream-token');
-const CHUNK = 4 * 1024 * 1024;
+const CHUNK = 4 * 1024 * 1024; // 4 MB, abaixo do limite de 4.5 MB do Vercel
 
 function privateIp(ip) {
   if (net.isIPv4(ip)) {
@@ -20,19 +20,18 @@ function privateIp(ip) {
   return true;
 }
 
-function forceHttp(value) {
+function normalizeProtocol(value) {
   const url = new URL(value);
-  if (url.protocol === 'https:') {
-    url.protocol = 'http:';
-    if (url.port === '443') url.port = '';
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('Este proxy aceita apenas origens HTTP ou HTTPS.');
   }
-  if (url.protocol !== 'http:') throw new Error('Este proxy aceita somente origens Xtream HTTP.');
+  if (url.username || url.password) throw new Error('URL de mídia inválida: não são permitidas credenciais embutidas no host.');
   return url;
 }
 
 async function assertPublic(url) {
-  if (url.protocol !== 'http:' || url.username || url.password) {
-    throw new Error('URL de mídia inválida: o proxy Xtream exige HTTP sem credenciais embutidas no host.');
+  if (url.username || url.password) {
+    throw new Error('URL de mídia inválida: o proxy não aceita credenciais embutidas no host.');
   }
   const host = url.hostname.toLowerCase();
   if (host === 'localhost' || host.endsWith('.local')) throw new Error('Host local bloqueado.');
@@ -41,12 +40,12 @@ async function assertPublic(url) {
 }
 
 function tokenUrl(url, exp) {
-  return `/api/proxy?t=${encodeURIComponent(encode({ url: forceHttp(url).toString(), exp }))}`;
+  return `/api/proxy?t=${encodeURIComponent(encode({ url: normalizeProtocol(url).toString(), exp }))}`;
 }
 
 function rewritePlaylist(text, baseUrl, exp) {
   const absolute = value => {
-    try { return forceHttp(new URL(value.trim(), baseUrl)).toString(); } catch { return ''; }
+    try { return normalizeProtocol(new URL(value.trim(), baseUrl)).toString(); } catch { return ''; }
   };
   return text.split(/\r?\n/).map(line => {
     const trimmed = line.trim();
@@ -79,7 +78,7 @@ module.exports = async function handler(req, res) {
   let controller;
   try {
     const payload = decode(req.query?.t);
-    let current = forceHttp(payload.url);
+    let current = normalizeProtocol(payload.url);
     const requestedRange = req.headers.range;
     let range = requestedRange;
     const originalOrigin = current.origin;
@@ -102,22 +101,21 @@ module.exports = async function handler(req, res) {
     for (let hops = 0; hops < 6; hops++) {
       await assertPublic(current);
       const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': process.env.XTREAM_STREAM_USER_AGENT || process.env.XTREAM_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         Accept: '*/*',
         'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache',
-        Origin: current.origin,
-        Referer: current.origin === originalOrigin ? originalReferer : `${current.origin}/`
+        Origin: originalOrigin,
+        Referer: originalReferer
       };
       if (range) headers.Range = range;
       if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-      // Xtream/origem: sempre GET por HTTP; sem HEAD e sem retry HTTPS.
       upstream = await fetch(current, { method: 'GET', headers, redirect: 'manual', signal: controller.signal });
       if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
       const location = upstream.headers.get('location');
       if (!location) throw new Error('O host de mídia enviou um redirecionamento sem destino.');
-      current = forceHttp(new URL(location, current));
+      current = normalizeProtocol(new URL(location, current).toString());
       if (hops === 5) throw new Error('O host de mídia excedeu o limite de redirecionamentos.');
     }
     if (!upstream) throw new Error('O provedor não respondeu.');
@@ -131,7 +129,7 @@ module.exports = async function handler(req, res) {
         return res.status(416).end();
       }
       const hint = upstream.status === 401 || upstream.status === 403
-        ? ' O provedor recusou as credenciais ou o acesso a este stream.' : '';
+        ? ' O provedor recusou as credenciais ou o acesso a este stream. Verifique o User-Agent configurado em XTREAM_USER_AGENT e se o IP da Vercel é permitido pelo provedor.' : '';
       const message = `O host de mídia respondeu HTTP ${upstream.status}.${hint}`;
       setStreamError(res, message);
       return res.status(502).json({ error: message });
@@ -147,7 +145,7 @@ module.exports = async function handler(req, res) {
       if (!/^\uFEFF?\s*#EXTM3U(?:\s|$)/i.test(body)) {
         const blocked = /forbidden|access denied|unauthorized|cloudflare|error 403/i.test(body.slice(0, 2000));
         const message = blocked
-          ? 'O provedor devolveu uma página de bloqueio no lugar da playlist HLS.'
+          ? 'O provedor devolveu uma página de bloqueio no lugar da playlist HLS. Verifique o User-Agent e as permissões da conta.'
           : `O endereço .m3u8 não devolveu uma playlist HLS válida (HTTP ${upstream.status}).`;
         setStreamError(res, message);
         return res.status(502).json({ error: message });
@@ -161,7 +159,7 @@ module.exports = async function handler(req, res) {
       const body = await upstream.text();
       const blocked = /forbidden|access denied|unauthorized|cloudflare|error 403/i.test(body.slice(0, 2000));
       const message = blocked
-        ? 'O provedor devolveu uma página de bloqueio no lugar do segmento de vídeo.'
+        ? 'O provedor devolveu uma página de bloqueio no lugar do segmento de vídeo. Verifique o User-Agent e as permissões da conta.'
         : `O provedor devolveu ${type || 'conteúdo textual'} em vez de mídia (${current.pathname.split('/').pop()}).`;
       setStreamError(res, message);
       return res.status(502).json({ error: message });
@@ -186,10 +184,10 @@ module.exports = async function handler(req, res) {
     const missingSecret = e.message.includes('STREAM_PROXY_SECRET');
     const connection = e.cause?.code || e.code;
     const message = missingSecret ? e.message : connection === 'ECONNREFUSED'
-      ? 'CONNECTION_REFUSED: a origem HTTP recusou a conexão da Vercel. Confirme o host e a porta HTTP Xtream com o provedor.'
-      : e.name === 'TimeoutError' ? 'O host de mídia HTTP não respondeu dentro do tempo limite.'
-      : e.message.includes('Host privado') || e.message.includes('Host local') || e.message.includes('somente origens Xtream HTTP') ? e.message
-      : 'Não foi possível buscar o stream HTTP no provedor. Confira o endereço de mídia e a conectividade do servidor.';
+      ? 'CONNECTION_REFUSED: a origem recusou a conexão da Vercel. Confirme o host e a porta com o provedor.'
+      : e.name === 'TimeoutError' ? 'O host de mídia não respondeu dentro do tempo limite.'
+      : e.message.includes('Host privado') || e.message.includes('Host local') || e.message.includes('somente origens') ? e.message
+      : 'Não foi possível buscar o stream no provedor. Confira o endereço de mídia e a conectividade do servidor.';
     setStreamError(res, message);
     return res.status(502).json({ error: message });
   }
