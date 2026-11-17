@@ -14,7 +14,7 @@ const catalogActions={filmes:['get_vod_streams','get_vod_categories'],series:['g
 function setPage(p){page=p;selectedCategory='all';visibleCount=30;$('search').value='';document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('sel',b.dataset.p===p));const type=pageType();if(type&&!loadedTypes[type])loadCatalog(type).catch(()=>{});else if(!type&&(p==='favoritos'||p==='recentes'))loadCatalog(null).catch(()=>{});render()}function pageType(){return({filmes:'filmes',series:'series',canais:'canais'})[page]}function searchChanged(){visibleCount=30;const q=$('search').value.trim();if(q&&page==='inicio')Promise.all(['series','canais'].map(t=>loadedTypes[t]?Promise.resolve():loadCatalog(t).catch(()=>null)));render()}function render(){if($('app').classList.contains('hidden'))return;let q=$('search').value.trim().toLowerCase(),type=pageType();let list=items.filter(x=>{const match=!q||x.name.toLowerCase().includes(q)||String(x.genre).toLowerCase().includes(q);const typed=!type||x.type===type;const category=selectedCategory==='all'||x.categoryId===selectedCategory;const localList=page==='favoritos'?isFavorite(x):page==='recentes'?isRecent(x):true;return match&&typed&&category&&localList});let hero=page==='inicio'?`<section class="hero"><div><h1>Seu entretenimento.<br>Do seu jeito.</h1><p>Filmes, séries e canais carregados diretamente da sua conta.</p><button class="red" onclick="setPage('filmes')">▶ Explorar filmes</button> <button class="outline" onclick="setPage('canais')">Ver canais ao vivo</button></div></section>`:'';let title={inicio:'Catálogo',filmes:'Filmes',series:'Séries',canais:'Canais ao vivo',favoritos:'Minha lista',recentes:'Continuar assistindo'}[page];let tools=type?`<div class="toolbar"><label>Categoria <select id="categoryFilter" onchange="selectedCategory=this.value;visibleCount=30;render()"><option value="all">Todas</option>${categories[type].map(c=>`<option value="${esc(c.category_id)}" ${String(c.category_id)===selectedCategory?'selected':''}>${esc(c.category_name)}</option>`).join('')}</select></label><span class="muted">${list.length} título(s)</span></div>`:'';const shown=list.slice(0,visibleCount);$('main').innerHTML=hero+`<div class="wrap"><h2 class="section-title">${title}</h2>${tools}<div class="grid">${shown.map(card).join('')||'<p class="empty">Nenhum título nesta lista/categoria.</p>'}</div>${shown.length<list.length?'<div id="loadMoreSentinel" class="loading" style="text-align:center">Carregando mais títulos ao rolar…</div>':''}</div>`;observeMore()}function observeMore(){if(scrollObserver)scrollObserver.disconnect();const el=$('loadMoreSentinel');if(!el)return;if('IntersectionObserver'in window){scrollObserver=new IntersectionObserver(entries=>{if(entries.some(e=>e.isIntersecting))loadMore()}, {rootMargin:'500px'});scrollObserver.observe(el)}else window.addEventListener('scroll',fallbackLoadMore,{passive:true})}function loadMore(){const el=$('loadMoreSentinel');if(!el)return;visibleCount+=30;render()}function fallbackLoadMore(){const el=$('loadMoreSentinel');if(el&&el.getBoundingClientRect().top<window.innerHeight+500){window.removeEventListener('scroll',fallbackLoadMore);loadMore()}}function card(x){return `<article class="card" onclick="details('${esc(x.id)}')"><div class="poster" style="${x.cover?`background-image:linear-gradient(0deg,#0008,transparent 60%),url('${esc(x.cover)}')`:''}"><i class="badge">${x.type==='canais'?'AO VIVO':x.type==='series'?'SÉRIE':'FILME'}</i>${isFavorite(x)?'<span class="favorite-mark">♥</span>':''}${x.cover?'':`<b>${esc(x.name)}</b>`}</div><div class="info"><strong>${esc(x.name)}</strong><span class="muted">${esc(x.genre)}${x.year?' · '+esc(x.year):''}</span></div></article>`}
 function favKey(x){return`${profile.id}:${x.type}:${x.id}`}function isFavorite(x){return read(FAV_KEY,[]).includes(favKey(x))}function isRecent(x){return read(RECENT_KEY,[]).some(a=>a.profile===profile.id&&a.key===`${x.type}:${x.id}`)}function toggleFavorite(id){let x=items.find(a=>a.id===id);if(!x)return;let f=read(FAV_KEY,[]),k=favKey(x);write(FAV_KEY,f.includes(k)?f.filter(a=>a!==k):[...f,k]);details(id,true)}function addRecent(item){let r=read(RECENT_KEY,[]),key=`${item.type}:${item.id}`;r=r.filter(a=>!(a.profile===profile.id&&a.key===key));r.unshift({profile:profile.id,key,id:item.id,type:item.type,date:Date.now()});write(RECENT_KEY,r.slice(0,100))}
 
-/* ---------- MODAL STACK (persistência de navegação em camadas) ---------- */
+/* ---------- MODAL STACK ---------- */
 let modalStack=[],historyDepth=0,suppressPopstate=false;
 function openReplace(html){$('modalContent').innerHTML=html;$('modal').classList.remove('hidden')}
 function open(html){
@@ -87,75 +87,151 @@ async function details(id,replace=false){
   body.outerHTML=`<div class="detail-layout"><div class="detail-poster" style="${poster?`background-image:url('${esc(poster)}')`:''}">${poster?'':esc(x.name)}</div><div><div class="muted">${esc(x.type)} ${released?' · '+esc(released):''} ${rating?' · ★ '+esc(rating):''}</div><p>${esc(plot||'Sem sinopse disponível no provedor.')}</p>${director?`<p class="muted">Direção: ${esc(director)}</p>`:''}${cast?`<p class="muted">Elenco: ${esc(cast)}</p>`:''}<div class="toolbar"><button class="red" onclick="${x.type==='series'?`showEpisodes('${esc(x.id)}')`:`playItem('${esc(x.id)}')`}">${x.type==='series'?'▶ Ver episódios':'▶ Reproduzir'}</button><button onclick="toggleFavorite('${esc(x.id)}')">${isFavorite(x)?'♥ Remover dos favoritos':'＋ Minha lista'}</button></div><div id="episodeArea"></div>${extra._error?`<p class="muted">${esc(extra._error)}</p>`:''}</div></div>`;
 }
 async function showEpisodes(id){$('episodeArea').innerHTML='<div class="loading">Carregando temporadas e episódios…</div>';try{const d=await api('get_series_info',{series_id:id});const eps=d.episodes||{};let keys=Object.keys(eps);if(!keys.length)throw Error('O provedor não retornou episódios para esta série.');seriesEpisodeCache[id]=eps;let opts=keys.map(k=>`<option value="${esc(k)}">Temporada ${esc(k)}</option>`).join('');$('episodeArea').innerHTML=`<label class="field">Temporada<select id="seasonSelect" data-series-id="${esc(id)}" onchange="renderEpisodes('${esc(id)}')">${opts}</select></label><div id="episodeList"></div>`;renderEpisodes(id)}catch(e){$('episodeArea').innerHTML=`<div class="status err">${esc(e.message)}</div>`}}function renderEpisodes(id){const eps=seriesEpisodeCache[id]||{},key=$('seasonSelect')?.value||Object.keys(eps)[0],arr=eps[key]||[];const list=$('episodeList');if(!list)return;list.innerHTML=arr.map((ep,i)=>`<div class="episode"><span><b>${esc(ep.title||ep.name||'Episódio '+(i+1))}</b><br><span class="muted">${esc(ep.info?.plot||ep.plot||'')}</span></span><button class="red" onclick="playEpisode('${esc(id)}','${/^\d{1,20}$/.test(String(ep.id||ep.stream_id))?String(ep.id||ep.stream_id):''}','${/^[a-zA-Z0-9]{1,10}$/.test(String(ep.container_extension||'mp4'))?String(ep.container_extension||'mp4'):'mp4'}')">▶</button></div>`).join('')||'<p class="empty">Nenhum episódio nesta temporada.</p>'}
-function playItem(id){const x=items.find(a=>a.id===id);if(!x)return;addRecent(x);const kind=x.type==='filmes'?'movie':'live',original=x.ext||(kind==='live'?'ts':'mp4'),formats=kind==='live'?['m3u8','ts','mp4']:['mp4',original,'m3u8'];const uniqueFormats=formats.filter((v,i,a)=>a.indexOf(v)===i);showPlayer(x.name,{kind,id:String(x.streamId),ext:uniqueFormats[0]},uniqueFormats)}function playEpisode(seriesId,episodeId,ext){if(!/^\d{1,20}$/.test(String(episodeId)))return alert('ID de episódio inválido.');const x=items.find(a=>a.id===seriesId);if(x)addRecent(x);const formats=['m3u8','mp4'];showPlayer('Reproduzindo episódio',{kind:'series',id:String(episodeId),ext:formats[0]},formats)}
+
+/* ---------- PLAYER ---------- */
+function playItem(id){
+  const x=items.find(a=>a.id===id);if(!x)return;addRecent(x);
+  const kind=x.type==='filmes'?'movie':x.type==='series'?'series':'live';
+  let formats;
+  if(kind==='live'){
+    // Canal ao vivo: SOMENTE m3u8 (fallback = reconectar m3u8)
+    formats=['m3u8','m3u8'];
+  }else{
+    // Filmes/séries: MP4 primeiro, m3u8 como alternativa
+    const original=(x.ext||'mp4').toLowerCase();
+    formats=original==='m3u8'?['m3u8','mp4']:['mp4','m3u8'];
+  }
+  showPlayer(x.name,{kind,id:String(x.streamId)},formats);
+}
+function playEpisode(seriesId,episodeId,ext){
+  if(!/^\d{1,20}$/.test(String(episodeId)))return alert('ID de episódio inválido.');
+  const x=items.find(a=>a.id===seriesId);if(x)addRecent(x);
+  const original=(ext||'mp4').toLowerCase();
+  const formats=original==='m3u8'?['m3u8','mp4']:['mp4','m3u8'];
+  showPlayer('Reproduzindo episódio',{kind:'series',id:String(episodeId)},formats);
+}
 let playerVariants=[],playerTried=new Set(),playerRequestId=0;
 function showPlayer(title,spec,formats){
- playerVariants=formats.map(ext=>({...spec,ext}));playerTried=new Set();
- open(`<div class="modalhead"><h2>${esc(title)}</h2><button class="close" onclick="closeModal()">×</button></div><div class="video-wrap"><video id="player" controls playsinline></video></div><div id="playerMsg" class="muted" role="status" aria-live="polite" style="margin-top:8px">Preparando stream…</div><div class="player-actions"><select id="playerVariant" onchange="startPlayer(this.value)" aria-label="Formato de reprodução" style="background:#222;color:white;border:1px solid #555;padding:9px;border-radius:4px">${playerVariants.map((v,i)=>`<option value="${i}">${i===0?'Preferido':v.ext.toUpperCase()}</option>`).join('')}</select><button class="outline" onclick="toggleFullscreen()">Tela cheia</button><button class="outline" onclick="retryPlayer()">Tentar novamente</button></div>`);
- startPlayer('0')
+  playerVariants=formats.map(ext=>({...spec,ext}));
+  playerTried=new Set();
+  const isLive=spec.kind==='live';
+  open(`<div class="modalhead"><h2>${esc(title)}</h2><button class="close" onclick="closeModal()">×</button></div><div class="video-wrap"><video id="player" controls playsinline></video></div><div id="playerMsg" class="muted" role="status" aria-live="polite" style="margin-top:8px">Preparando stream…</div><div class="player-actions"><select id="playerVariant" onchange="startPlayer(this.value)" aria-label="Formato de reprodução" style="background:#222;color:white;border:1px solid #555;padding:9px;border-radius:4px">${playerVariants.map((v,i)=>`<option value="${i}">${i===0?(isLive?'AO VIVO':'Preferido'):v.ext.toUpperCase()+(isLive?' (reconectar)':'')}</option>`).join('')}</select><button class="outline" onclick="toggleFullscreen()">Tela cheia</button><button class="outline" onclick="retryPlayer()">Tentar novamente</button></div>`);
+  startPlayer('0')
 }
 function fallbackVariant(reason){
- const next=playerVariants.findIndex((_,i)=>!playerTried.has(i));if(next<0)return false;
- const sel=$('playerVariant');if(sel)sel.value=String(next);
- $('playerMsg').textContent=`${reason} Tentando automaticamente ${playerVariants[next].ext.toUpperCase()}…`;
- startPlayer(String(next));return true
+  const next=playerVariants.findIndex((_,i)=>!playerTried.has(i));
+  if(next<0)return false;
+  const sel=$('playerVariant');if(sel)sel.value=String(next);
+  const isLive=playerVariants[next].kind==='live';
+  $('playerMsg').textContent=`${reason} ${isLive?'Reconectando o canal ao vivo…':`Tentando automaticamente ${playerVariants[next].ext.toUpperCase()}…`}`;
+  startPlayer(String(next));return true
 }
 function mediaErrorLabel(video){
- const code=video?.error?.code;
- return ({1:'reprodução interrompida',2:'falha de rede',3:'o navegador não conseguiu decodificar o áudio/vídeo (codec ou dados inválidos)',4:'formato ou codec não suportado'})[code]||'erro de reprodução';
+  const code=video?.error?.code;
+  return ({1:'reprodução interrompida',2:'falha de rede',3:'o navegador não conseguiu decodificar o áudio/vídeo',4:'formato ou codec não suportado'})[code]||'erro de reprodução';
 }
 async function proxyDiagnostic(url){
- if(!url)return '';
- try{const target=new URL(url,location.href);if(target.origin!==location.origin)return '';const r=await fetch(target,{method:'GET',headers:{Accept:'*/*',Range:'bytes=0-0'},cache:'no-store'});const hint=r.headers.get('X-Stream-Error');if(hint){if(r.body)r.body.cancel().catch(()=>{});return hint}if(!r.ok){try{return (await responseJson(r,'Proxy de mídia')).error||`Proxy respondeu HTTP ${r.status}.`}catch(e){return e.message}}if(r.body)r.body.cancel().catch(()=>{});return ''}catch{return ''}
+  if(!url)return '';
+  try{const target=new URL(url,location.href);if(target.origin!==location.origin)return '';const r=await fetch(target,{method:'GET',headers:{Accept:'*/*',Range:'bytes=0-0'},cache:'no-store'});const hint=r.headers.get('X-Stream-Error');if(hint){if(r.body)r.body.cancel().catch(()=>{});return hint}if(!r.ok){try{return (await responseJson(r,'Proxy de mídia')).error||`Proxy respondeu HTTP ${r.status}.`}catch(e){return e.message}}if(r.body)r.body.cancel().catch(()=>{});return ''}catch{return ''}
 }
 async function startPlayer(input){
- const idx=Number(input),spec=playerVariants[idx],v=$('player');if(!v||!spec)return;
- const requestId=++playerRequestId;playerTried.add(idx);
- if(hls){hls.destroy();hls=null}v.onerror=null;v.pause();v.removeAttribute('src');v.load();
- $('playerMsg').textContent=`Verificando ${spec.ext.toUpperCase()} no provedor…`;
- try{
-  const ticketQuery=new URLSearchParams({kind:spec.kind,id:spec.id,ext:spec.ext});const r=await fetch(`/api/stream-ticket?${ticketQuery}`,{method:'GET',headers:{Accept:'application/json'},cache:'no-store'});
-  const data=await responseJson(r,'/api/stream-ticket');if(!r.ok)throw Error(data.error||'Falha ao preparar stream.');if(requestId!==playerRequestId)return;
-  const url=data.url;if(requestId!==playerRequestId)return;
-  const isHls=spec.ext.toLowerCase()==='m3u8';
-  if(isHls){
-   if(v.canPlayType('application/vnd.apple.mpegurl')){v.src=url;v.play().catch(()=>{$('playerMsg').textContent='Stream HLS conectado. Pressione reproduzir para iniciar.'})}
-   else if(window.Hls&&Hls.isSupported()){
-    let mediaRecoveries=0,networkRecoveries=0;
-    hls=new Hls({enableWorker:true,lowLatencyMode:true,maxBufferLength:10,maxMaxBufferLength:30,backBufferLength:30,manifestLoadingMaxRetry:4,manifestLoadingRetryDelay:500,manifestLoadingMaxRetryTimeout:8000,levelLoadingMaxRetry:5,levelLoadingRetryDelay:500,levelLoadingMaxRetryTimeout:10000,fragLoadingMaxRetry:5,fragLoadingRetryDelay:500,fragLoadingMaxRetryTimeout:10000});
-    hls.on(Hls.Events.ERROR,(_,d)=>{
-     if(!d.fatal)return;
-     const details=d.details||'erro HLS',status=d.response?.code||d.networkDetails?.status||'',type=d.type||'erro';
-     // Erro de mídia: tenta recuperar o decodificador uma vez
-     if(d.type===Hls.ErrorTypes.MEDIA_ERROR&&mediaRecoveries<1){mediaRecoveries++;$('playerMsg').textContent=`Recuperando decodificador HLS após ${details}…`;hls.recoverMediaError();return}
-     // Erro de rede: tenta reconectar até 2 vezes antes de mudar de formato
-     if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&networkRecoveries<2){networkRecoveries++;$('playerMsg').textContent=`Falha de rede HLS (${details}${status?`, HTTP ${status}`:''}); tentando reconectar (${networkRecoveries}/2)…`;setTimeout(()=>{if(requestId===playerRequestId&&hls)hls.startLoad(-1)},800*networkRecoveries);return}
-     const reason=`HLS falhou: ${details}${status?` (HTTP ${status})`:''}.`;
-     if(fallbackVariant(reason))return;
-     // Mensagem final diferenciando rede de codec
-     const isNetwork = d.type===Hls.ErrorTypes.NETWORK_ERROR;
-     $('playerMsg').textContent = isNetwork
-       ? `${reason} O proxy não conseguiu acessar o servidor de origem; verifique se o provedor bloqueia IPs da Vercel ou se a porta está correta.`
-       : `${reason} O navegador recebeu mídia, mas não decodificou; codec/perfil de vídeo pode ser incompatível.`;
-     const failedUrl=d.response?.url||d.url||d.context?.url;
-     proxyDiagnostic(failedUrl).then(msg=>{if(msg&&requestId===playerRequestId)$('playerMsg').textContent=`${reason} ${msg}`});
-    });
-    hls.on(Hls.Events.MANIFEST_PARSED,()=>{if(requestId===playerRequestId)v.play().catch(()=>{$('playerMsg').textContent='Playlist HLS carregada. Pressione reproduzir para iniciar.'})});
-    hls.on(Hls.Events.LEVEL_LOADED,()=>{if(requestId===playerRequestId)$('playerMsg').textContent='Playlist HLS carregada; aguardando segmentos de vídeo…'});
-    hls.loadSource(url);hls.attachMedia(v)
-   }else throw Error('Este navegador não tem suporte a HLS.js nem a HLS nativo.')
-  }else{v.src=url;v.play().catch(()=>{$('playerMsg').textContent=`Stream ${spec.ext.toUpperCase()} conectado. Pressione reproduzir para iniciar.`})}
-  v.onerror=()=>{
-   const label=mediaErrorLabel(v);
-   const isNetwork=v.error?.code===2;
-   const message=isNetwork
-     ? `Erro de rede: ${label}. O servidor de origem pode estar bloqueando a conexão do proxy.`
-     : `${spec.ext.toUpperCase()}: ${label}.`;
-   if(fallbackVariant(message))return;
-   $('playerMsg').textContent=`${message} Todas as variantes foram tentadas. Se o proxy entregou os dados, o vídeo pode usar codec/perfil não suportado pelo navegador.`;
-   proxyDiagnostic(url).then(reason=>{if(reason&&requestId===playerRequestId)$('playerMsg').textContent=`${message} ${reason}`})
-  };
- }catch(e){if(requestId===playerRequestId)$('playerMsg').textContent=e.message;console.error('Falha na reprodução:',e)}
+  const idx=Number(input),spec=playerVariants[idx],v=$('player');if(!v||!spec)return;
+  const requestId=++playerRequestId;playerTried.add(idx);
+  const isLive=spec.kind==='live';
+  if(hls){hls.destroy();hls=null}
+  v.onerror=null;v.pause();v.removeAttribute('src');v.load();
+  $('playerMsg').textContent=`Verificando ${spec.ext.toUpperCase()} no provedor…`;
+  try{
+    const ticketQuery=new URLSearchParams({kind:spec.kind,id:spec.id,ext:spec.ext});
+    const r=await fetch(`/api/stream-ticket?${ticketQuery}`,{method:'GET',headers:{Accept:'application/json'},cache:'no-store'});
+    const data=await responseJson(r,'/api/stream-ticket');
+    if(!r.ok)throw Error(data.error||'Falha ao preparar stream.');
+    if(requestId!==playerRequestId)return;
+    const url=data.url;if(requestId!==playerRequestId)return;
+    const isHls=spec.ext.toLowerCase()==='m3u8';
+
+    if(isHls){
+      if(v.canPlayType('application/vnd.apple.mpegurl')){
+        v.src=url;
+        v.play().catch(()=>{$('playerMsg').textContent='Stream HLS conectado. Pressione reproduzir para iniciar.'});
+      }else if(window.Hls&&Hls.isSupported()){
+        let mediaRecoveries=0,networkRecoveries=0;
+        hls=new Hls({
+          enableWorker:true,
+          lowLatencyMode:isLive,
+          maxBufferLength:isLive?8:30,
+          maxMaxBufferLength:isLive?30:60,
+          backBufferLength:30,
+          manifestLoadingMaxRetry:4,
+          manifestLoadingRetryDelay:500,
+          manifestLoadingMaxRetryTimeout:8000,
+          levelLoadingMaxRetry:5,
+          levelLoadingRetryDelay:500,
+          levelLoadingMaxRetryTimeout:10000,
+          fragLoadingMaxRetry:5,
+          fragLoadingRetryDelay:500,
+          fragLoadingMaxRetryTimeout:10000
+        });
+        hls.on(Hls.Events.ERROR,(_,d)=>{
+          if(!d.fatal)return;
+          const details=d.details||'erro HLS';
+          const status=d.response?.code||d.networkDetails?.status||'';
+          const type=d.type||'erro';
+
+          if(d.type===Hls.ErrorTypes.MEDIA_ERROR&&mediaRecoveries<1){
+            mediaRecoveries++;
+            $('playerMsg').textContent=`Recuperando decodificador HLS após ${details}…`;
+            hls.recoverMediaError();return
+          }
+          if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&networkRecoveries<3){
+            networkRecoveries++;
+            $('playerMsg').textContent=`Falha de rede HLS (${details}${status?`, HTTP ${status}`:''}); reconectando (${networkRecoveries}/3)…`;
+            setTimeout(()=>{if(requestId===playerRequestId&&hls)hls.startLoad(-1)},800*networkRecoveries);
+            return
+          }
+
+          const reason=`HLS falhou: ${details}${status?` (HTTP ${status})`:''}.`;
+          // Canal ao vivo: tenta reconectar o mesmo M3U8 (fallback de variante)
+          if(isLive){
+            if(fallbackVariant(reason))return;
+            $('playerMsg').textContent=`${reason} Não foi possível reconectar o canal ao vivo. O provedor pode estar limitando conexões simultâneas.`;
+            return
+          }
+          // Filme/série: tenta próxima variante (m3u8 -> mp4 ou vice-versa)
+          if(fallbackVariant(reason))return;
+          $('playerMsg').textContent=`${reason} Todas as variantes foram tentadas.`;
+          const failedUrl=d.response?.url||d.url||d.context?.url;
+          proxyDiagnostic(failedUrl).then(msg=>{if(msg&&requestId===playerRequestId)$('playerMsg').textContent=`${reason} ${msg}`});
+        });
+        hls.on(Hls.Events.MANIFEST_PARSED,()=>{if(requestId===playerRequestId)v.play().catch(()=>{$('playerMsg').textContent='Playlist HLS carregada. Pressione reproduzir para iniciar.'})});
+        hls.on(Hls.Events.LEVEL_LOADED,()=>{if(requestId===playerRequestId)$('playerMsg').textContent='Playlist HLS carregada; aguardando segmentos…'});
+        hls.loadSource(url);hls.attachMedia(v)
+      }else throw Error('Este navegador não tem suporte a HLS.js nem a HLS nativo.')
+    }else{
+      v.src=url;
+      v.play().catch(()=>{$('playerMsg').textContent=`Stream ${spec.ext.toUpperCase()} conectado. Pressione reproduzir para iniciar.`})
+    }
+
+    v.onerror=()=>{
+      const label=mediaErrorLabel(v);
+      const isNetwork=v.error?.code===2;
+      const message=isNetwork
+        ? `Erro de rede: ${label}.`
+        : `${spec.ext.toUpperCase()}: ${label}.`;
+      // Canal ao vivo: não troca para TS/MP4; tenta reconectar o m3u8
+      if(isLive){
+        if(fallbackVariant(message))return;
+        $('playerMsg').textContent=`${message} Não foi possível reconectar.`;
+        return
+      }
+      if(fallbackVariant(message))return;
+      $('playerMsg').textContent=`${message} Todas as variantes foram tentadas.`;
+      proxyDiagnostic(url).then(reason=>{if(reason&&requestId===playerRequestId)$('playerMsg').textContent=`${message} ${reason}`})
+    };
+  }catch(e){
+    if(requestId===playerRequestId)$('playerMsg').textContent=e.message;
+    console.error('Falha na reprodução:',e)
+  }
 }
 function retryPlayer(){playerTried=new Set();const sel=$('playerVariant');if(sel)startPlayer(sel.value)}
 function toggleFullscreen(){const v=$('player');if(!v)return;if(document.fullscreenElement)document.exitFullscreen();else if(v.requestFullscreen)v.requestFullscreen();else if(v.webkitEnterFullscreen)v.webkitEnterFullscreen()}
