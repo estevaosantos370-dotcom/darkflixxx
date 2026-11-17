@@ -1,6 +1,26 @@
 {
+  "rewrites": [
+    { "source": "/api/proxy", "destination": "/api/proxy.js" },
+    { "source": "/api/stream", "destination": "/api/stream.js" },
+    { "source": "/api/stream-ticket", "destination": "/api/stream-ticket.js" },
+    { "source": "/api/xtream", "destination": "/api/xtream.js" }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET, OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Accept, Range, If-Range, Content-Type, User-Agent, Cache-Control, Pragma, Icy-MetaData" },
+        { "key": "Access-Control-Expose-Headers", "value": "Content-Range, Accept-Ranges, X-Stream-Error" },
+        { "key": "Cache-Control", "value": "no-store" }
+      ]
+    }
+  ],
   "functions": {
     "api/xtream.js": { "maxDuration": 30 },
-    "api/stream.js": { "maxDuration": 300 }
+    "api/stream-ticket.js": { "maxDuration": 30 },
+    "api/stream.js": { "maxDuration": 300 },
+    "api/proxy.js": { "maxDuration": 300 }
   }
 }
