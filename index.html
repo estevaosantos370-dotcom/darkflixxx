@@ -12,6 +12,7 @@ async function responseJson(r,label){const text=await r.text();try{return JSON.p
 
 /* ---------- CONEXÃO DIRETA + FALLBACK PARA PROXY ---------- */
 let XTREAM_BASE_HOST = null;
+let XTREAM_IS_HTTPS = false;
 
 async function loadXtreamHost() {
   if (XTREAM_BASE_HOST) return XTREAM_BASE_HOST;
@@ -20,6 +21,7 @@ async function loadXtreamHost() {
     if (r.ok) {
       const j = await r.json();
       XTREAM_BASE_HOST = j.host || null;
+      XTREAM_IS_HTTPS = !!j.https;
     }
   } catch {}
   return XTREAM_BASE_HOST;
@@ -31,9 +33,9 @@ async function api(action, extra = {}) {
     ...Object.fromEntries(Object.entries(extra).map(([k, v]) => [k, String(v)]))
   });
 
-  // 1) Tenta conexão DIRETA ao servidor Xtream (como o HTML de referência)
+  // 1) Conexão DIRETA — só se o servidor for HTTPS (evita Mixed Content)
   const baseHost = await loadXtreamHost();
-  if (baseHost) {
+  if (baseHost && XTREAM_IS_HTTPS) {
     try {
       const directUrl = `${baseHost}/player_api.php?${params}`;
       const r = await fetch(directUrl, {
@@ -51,8 +53,10 @@ async function api(action, extra = {}) {
         }
       }
     } catch (e) {
-      console.warn('Conexão direta falhou, usando proxy:', e.message);
+      console.warn('Conexão direta HTTPS falhou, usando proxy:', e.message);
     }
+  } else if (baseHost && !XTREAM_IS_HTTPS) {
+    console.info('Servidor HTTP detectado; conexão direta desabilitada (Mixed Content). Usando proxy.');
   }
 
   // 2) Fallback: proxy da Vercel
