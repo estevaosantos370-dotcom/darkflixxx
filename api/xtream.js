@@ -22,13 +22,12 @@ function isPrivate(ip) {
   return true;
 }
 
-function forceHttp(value) {
+function normalizeProtocol(value) {
   const url = new URL(value);
-  if (url.protocol === 'https:') {
-    url.protocol = 'http:';
-    if (url.port === '443') url.port = '';
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('XTREAM_HOST precisa usar HTTP ou HTTPS.');
   }
-  if (url.protocol !== 'http:') throw new Error('XTREAM_HOST precisa usar HTTP.');
+  if (url.username || url.password) throw new Error('XTREAM_HOST não deve conter credenciais na URL.');
   return url;
 }
 
@@ -47,7 +46,7 @@ function proxyImageUrls(value) {
       try {
         const image = new URL(item);
         if (!image.username && !image.password) {
-          const token = encode({ url: forceHttp(image).toString(), exp: Date.now() + 2 * 60 * 60 * 1000 });
+          const token = encode({ url: normalizeProtocol(image.toString()).toString(), exp: Date.now() + 2 * 60 * 60 * 1000 });
           value[name] = `/api/proxy?t=${encodeURIComponent(token)}`;
         }
       } catch {}
@@ -81,8 +80,8 @@ module.exports = async function handler(req, res) {
     if (host.length > 400 || username.length > 180 || password.length > 180)
       return res.status(400).json({ error: 'Campo excede o limite permitido.' });
 
-    let url = forceHttp(host.trim());
-    if (url.search || url.hash || url.username || url.password) return res.status(400).json({ error: 'Informe somente o host-base Xtream, sem query, fragmento ou credenciais na URL.' });
+    let url = normalizeProtocol(host.trim());
+    if (url.search || url.hash) return res.status(400).json({ error: 'Informe somente o host-base Xtream, sem query ou fragmento na URL.' });
     url.pathname = url.pathname.replace(/\/$/, '') + '/player_api.php';
     url.search = '';
     url.searchParams.set('username', username);
@@ -97,7 +96,7 @@ module.exports = async function handler(req, res) {
       upstream = await fetch(url, {
         method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(18000),
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'User-Agent': process.env.XTREAM_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           Accept: 'application/json, */*',
           'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
           'Cache-Control': 'no-cache', Pragma: 'no-cache',
@@ -107,7 +106,7 @@ module.exports = async function handler(req, res) {
       if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
       const location = upstream.headers.get('location');
       if (!location) return res.status(502).json({ error: 'O provedor enviou redirecionamento sem destino.' });
-      url = forceHttp(new URL(location, url));
+      url = normalizeProtocol(new URL(location, url).toString());
       if (hop === 5) return res.status(502).json({ error: 'O provedor excedeu o limite de redirecionamentos HTTP.' });
     }
     const text = await upstream.text();
