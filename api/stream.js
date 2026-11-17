@@ -1,6 +1,7 @@
 const dns = require('node:dns/promises');
 const net = require('node:net');
 const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const { decode, encode } = require('../lib/stream-token');
 const CHUNK = 4 * 1024 * 1024;
 
@@ -18,21 +19,26 @@ function privateIp(ip) {
   }
   return true;
 }
+
 async function assertPublic(url) {
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('URL de mídia inválida.');
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error('URL de mídia inválida.');
+  }
   const host = url.hostname.toLowerCase();
   if (host === 'localhost' || host.endsWith('.local')) throw new Error('Host local bloqueado.');
   const ips = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
   if (!ips.length || ips.some(x => privateIp(x.address))) throw new Error('Host privado bloqueado.');
 }
+
 function tokenUrl(url, exp) {
   return `/api/stream?t=${encodeURIComponent(encode({ url, exp }))}`;
 }
+
 function rewritePlaylist(text, baseUrl, exp) {
   const absolute = value => {
     try { return new URL(value.trim(), baseUrl).toString(); } catch { return ''; }
   };
-  const lines = text.split(/\r?\n/).map(line => {
+  return text.split(/\r?\n/).map(line => {
     const trimmed = line.trim();
     if (!trimmed) return line;
     if (!trimmed.startsWith('#')) {
@@ -43,23 +49,32 @@ function rewritePlaylist(text, baseUrl, exp) {
       const url = absolute(uri);
       return url ? `URI="${tokenUrl(url, exp)}"` : match;
     });
-  });
-  return lines.join('\n');
+  }).join('\n');
+}
+
+function setStreamError(res, message) {
+  res.setHeader('X-Stream-Error', message);
+  res.setHeader('Access-Control-Expose-Headers', 'X-Stream-Error, Content-Range, Accept-Ranges');
 }
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Stream-Error, Content-Range, Accept-Ranges');
   if (!['GET', 'HEAD'].includes(req.method)) return res.status(405).end('Use GET or HEAD.');
+
   let controller;
   try {
     const payload = decode(req.query?.t);
     let current = new URL(payload.url);
     const requestedRange = req.headers.range;
     let range = requestedRange;
+    const originalOrigin = current.origin;
+    const originalReferer = current.toString();
     const isPlaylist = /\.m3u8(?:$|\?)/i.test(current.href);
     const isMp4Like = /\.(mp4|m4v|mov|mkv)(?:$|\?)/i.test(current.href);
-    if (!isPlaylist && isMp4Like) {
+
+    if (!isPlaylist && isMp4Like && req.method !== 'HEAD') {
       const m = requestedRange && requestedRange.match(/^bytes=(\d+)-(\d*)$/);
       if (requestedRange && !m) return res.status(416).end('Invalid Range.');
       const start = m ? Number(m[1]) : 0;
@@ -67,13 +82,19 @@ module.exports = async function handler(req, res) {
       const end = Math.min(requestedEnd, start + CHUNK - 1);
       range = `bytes=${start}-${end}`;
     }
+
     controller = new AbortController();
     res.on('close', () => { if (!res.writableEnded) controller.abort(); });
     let upstream;
     for (let hops = 0; hops < 6; hops++) {
       await assertPublic(current);
-      const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36', 'Accept': '*/*' };
-      headers.Referer = `${current.origin}/`;
+      const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Accept: '*/*',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+        Referer: current.origin === originalOrigin ? originalReferer : `${current.origin}/`
+      };
       if (range) headers.Range = range;
       if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
       upstream = await fetch(current, { method: req.method, headers, redirect: 'manual', signal: controller.signal });
@@ -84,23 +105,58 @@ module.exports = async function handler(req, res) {
       if (hops === 5) throw new Error('O host de mídia excedeu o limite de redirecionamentos.');
     }
     if (!upstream) throw new Error('O provedor não respondeu.');
+
     const type = upstream.headers.get('content-type') || '';
     const playlist = /mpegurl|vnd\.apple\.mpegurl/i.test(type) || /\.m3u8(?:$|\?)/i.test(current.href);
     if (!upstream.ok && upstream.status !== 206) {
-      const hint = upstream.status === 401 || upstream.status === 403 ? ' O provedor recusou as credenciais ou o acesso ao stream.' : '';
-      return res.status(502).json({ error: `O host de mídia respondeu HTTP ${upstream.status}.${hint}` });
+      if (upstream.status === 416) {
+        const contentRange = upstream.headers.get('content-range');
+        if (contentRange) res.setHeader('Content-Range', contentRange);
+        return res.status(416).end();
+      }
+      const hint = upstream.status === 401 || upstream.status === 403
+        ? ' O provedor recusou as credenciais ou o acesso a este stream.' : '';
+      const message = `O host de mídia respondeu HTTP ${upstream.status}.${hint}`;
+      setStreamError(res, message);
+      return res.status(502).json({ error: message });
     }
+
     if (playlist && req.method !== 'HEAD') {
       const body = await upstream.text();
-      if (!body.trim()) return res.status(502).json({ error: 'O provedor devolveu uma playlist vazia.' });
+      if (!body.trim()) {
+        const message = 'O provedor devolveu uma playlist HLS vazia.';
+        setStreamError(res, message);
+        return res.status(502).json({ error: message });
+      }
+      if (!/^\uFEFF?\s*#EXTM3U(?:\s|$)/i.test(body)) {
+        const blocked = /forbidden|access denied|unauthorized|cloudflare|error 403/i.test(body.slice(0, 2000));
+        const message = blocked
+          ? 'O provedor devolveu uma página de bloqueio no lugar da playlist HLS.'
+          : `O endereço .m3u8 não devolveu uma playlist HLS válida (HTTP ${upstream.status}).`;
+        setStreamError(res, message);
+        return res.status(502).json({ error: message });
+      }
       res.statusCode = upstream.status === 206 ? 206 : 200;
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-      res.setHeader('Access-Control-Allow-Origin', '*');
       return res.end(rewritePlaylist(body, current, payload.exp));
     }
-    if (isMp4Like && range && upstream.status !== 206) {
-      return res.status(502).json({ error: 'O servidor de mídia não suporta Range/206; não é possível reproduzir este arquivo por partes.' });
+
+    if (/text\/html|application\/(?:json|xml)|text\/xml/i.test(type)) {
+      const body = req.method === 'HEAD' ? '' : await upstream.text();
+      const blocked = /forbidden|access denied|unauthorized|cloudflare|error 403/i.test(body.slice(0, 2000));
+      const message = blocked
+        ? 'O provedor devolveu uma página de bloqueio no lugar do segmento de vídeo.'
+        : `O provedor devolveu ${type || 'conteúdo textual'} em vez de mídia (${current.pathname.split('/').pop()}).`;
+      setStreamError(res, message);
+      return res.status(502).json({ error: message });
     }
+
+    if (isMp4Like && range && upstream.status !== 206) {
+      const message = 'O servidor de mídia ignorou Range e não respondeu 206; este arquivo não pode ser transmitido por partes.';
+      setStreamError(res, message);
+      return res.status(502).json({ error: message });
+    }
+
     res.statusCode = upstream.status;
     for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag']) {
       const value = upstream.headers.get(name);
@@ -108,7 +164,7 @@ module.exports = async function handler(req, res) {
     }
     if (isMp4Like) res.setHeader('Accept-Ranges', 'bytes');
     if (req.method === 'HEAD' || !upstream.body) return res.end();
-    Readable.fromWeb(upstream.body).pipe(res);
+    await pipeline(Readable.fromWeb(upstream.body), res);
   } catch (e) {
     if (res.headersSent || res.writableEnded) return;
     const missingSecret = e.message.includes('STREAM_PROXY_SECRET');
@@ -118,7 +174,7 @@ module.exports = async function handler(req, res) {
       : e.name === 'TimeoutError' ? 'O host de mídia não respondeu dentro do tempo limite.'
       : e.message.includes('Host privado') || e.message.includes('Host local') ? e.message
       : 'Não foi possível buscar o stream no provedor. Confira o endereço de mídia e a conectividade do servidor.';
-    res.setHeader('X-Stream-Error', message);
+    setStreamError(res, message);
     return res.status(502).json({ error: message });
   }
 };
