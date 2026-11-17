@@ -3,7 +3,7 @@ const net = require('node:net');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { decode, encode } = require('../lib/stream-token');
-const CHUNK = 4 * 1024 * 1024; // 4 MB, abaixo do limite de 4.5 MB do Vercel
+const CHUNK = 4 * 1024 * 1024;
 
 function privateIp(ip) {
   if (net.isIPv4(ip)) {
@@ -66,6 +66,18 @@ function setStreamError(res, message) {
   res.setHeader('Access-Control-Expose-Headers', 'X-Stream-Error, Content-Range, Accept-Ranges');
 }
 
+async function fetchWithRetry(url, options, retries = 1) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (e) {
+      const code = e.cause?.code || e.code;
+      if (attempt >= retries || (code !== 'ECONNRESET' && code !== 'ECONNREFUSED')) throw e;
+      await new Promise(r => setTimeout(r, 400));
+    }
+  }
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -111,7 +123,7 @@ module.exports = async function handler(req, res) {
       };
       if (range) headers.Range = range;
       if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-      upstream = await fetch(current, { method: 'GET', headers, redirect: 'manual', signal: controller.signal });
+      upstream = await fetchWithRetry(current, { method: 'GET', headers, redirect: 'manual', signal: controller.signal });
       if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
       const location = upstream.headers.get('location');
       if (!location) throw new Error('O host de mídia enviou um redirecionamento sem destino.');
@@ -129,7 +141,7 @@ module.exports = async function handler(req, res) {
         return res.status(416).end();
       }
       const hint = upstream.status === 401 || upstream.status === 403
-        ? ' O provedor recusou as credenciais ou o acesso a este stream. Verifique o User-Agent configurado em XTREAM_USER_AGENT e se o IP da Vercel é permitido pelo provedor.' : '';
+        ? ' O provedor recusou as credenciais ou o acesso a este stream.' : '';
       const message = `O host de mídia respondeu HTTP ${upstream.status}.${hint}`;
       setStreamError(res, message);
       return res.status(502).json({ error: message });
@@ -145,7 +157,7 @@ module.exports = async function handler(req, res) {
       if (!/^\uFEFF?\s*#EXTM3U(?:\s|$)/i.test(body)) {
         const blocked = /forbidden|access denied|unauthorized|cloudflare|error 403/i.test(body.slice(0, 2000));
         const message = blocked
-          ? 'O provedor devolveu uma página de bloqueio no lugar da playlist HLS. Verifique o User-Agent e as permissões da conta.'
+          ? 'O provedor devolveu uma página de bloqueio no lugar da playlist HLS.'
           : `O endereço .m3u8 não devolveu uma playlist HLS válida (HTTP ${upstream.status}).`;
         setStreamError(res, message);
         return res.status(502).json({ error: message });
@@ -159,16 +171,16 @@ module.exports = async function handler(req, res) {
       const body = await upstream.text();
       const blocked = /forbidden|access denied|unauthorized|cloudflare|error 403/i.test(body.slice(0, 2000));
       const message = blocked
-        ? 'O provedor devolveu uma página de bloqueio no lugar do segmento de vídeo. Verifique o User-Agent e as permissões da conta.'
-        : `O provedor devolveu ${type || 'conteúdo textual'} em vez de mídia (${current.pathname.split('/').pop()}).`;
+        ? 'O provedor devolveu uma página de bloqueio no lugar do segmento de vídeo.'
+        : `O provedor devolveu ${type || 'conteúdo textual'} em vez de mídia.`;
       setStreamError(res, message);
       return res.status(502).json({ error: message });
     }
 
+    // 关键修改：源站忽略 Range 返回 200 时，不再直接报错，而是回退为普通流式传输
     if (isMp4Like && range && upstream.status !== 206) {
-      const message = 'O servidor de mídia ignorou Range e não respondeu 206; este arquivo não pode ser transmitido por partes.';
-      setStreamError(res, message);
-      return res.status(502).json({ error: message });
+      res.removeHeader('Accept-Ranges');
+      res.setHeader('X-Stream-Warning', 'Origin ignorou Range; fallback to continuous stream.');
     }
 
     res.statusCode = upstream.status;
@@ -176,7 +188,7 @@ module.exports = async function handler(req, res) {
       const value = upstream.headers.get(name);
       if (value) res.setHeader(name, value);
     }
-    if (isMp4Like) res.setHeader('Accept-Ranges', 'bytes');
+    if (isMp4Like && upstream.status === 206) res.setHeader('Accept-Ranges', 'bytes');
     if (!upstream.body) return res.end();
     await pipeline(Readable.fromWeb(upstream.body), res);
   } catch (e) {
@@ -187,7 +199,7 @@ module.exports = async function handler(req, res) {
       ? 'CONNECTION_REFUSED: a origem recusou a conexão da Vercel. Confirme o host e a porta com o provedor.'
       : e.name === 'TimeoutError' ? 'O host de mídia não respondeu dentro do tempo limite.'
       : e.message.includes('Host privado') || e.message.includes('Host local') || e.message.includes('somente origens') ? e.message
-      : 'Não foi possível buscar o stream no provedor. Confira o endereço de mídia e a conectividade do servidor.';
+      : 'Não foi possível buscar o stream no provedor.';
     setStreamError(res, message);
     return res.status(502).json({ error: message });
   }
