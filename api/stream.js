@@ -4,6 +4,7 @@ const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { decode, encode } = require('../lib/stream-token');
 const CHUNK = 4 * 1024 * 1024;
+const TICKET_TTL = 6 * 60 * 60 * 1000;
 
 function privateIp(ip) {
   if (net.isIPv4(ip)) {
@@ -22,17 +23,13 @@ function privateIp(ip) {
 
 function normalizeProtocol(value) {
   const url = new URL(value);
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('Este proxy aceita apenas origens HTTP ou HTTPS.');
-  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('Este proxy aceita apenas origens HTTP ou HTTPS.');
   if (url.username || url.password) throw new Error('URL de mídia inválida: não são permitidas credenciais embutidas no host.');
   return url;
 }
 
 async function assertPublic(url) {
-  if (url.username || url.password) {
-    throw new Error('URL de mídia inválida: o proxy não aceita credenciais embutidas no host.');
-  }
+  if (url.username || url.password) throw new Error('URL de mídia inválida: o proxy não aceita credenciais embutidas no host.');
   const host = url.hostname.toLowerCase();
   if (host === 'localhost' || host.endsWith('.local')) throw new Error('Host local bloqueado.');
   const ips = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
@@ -43,7 +40,12 @@ function tokenUrl(url, exp) {
   return `/api/proxy?t=${encodeURIComponent(encode({ url: normalizeProtocol(url).toString(), exp }))}`;
 }
 
-function rewritePlaylist(text, baseUrl, exp) {
+function rewritePlaylist(text, baseUrl, parentExp) {
+  // Renova o ticket: se o ticket pai expira em menos de 1h, gera novo exp de 6h
+  const exp = (!parentExp || parentExp - Date.now() < 60 * 60 * 1000)
+    ? Date.now() + TICKET_TTL
+    : parentExp;
+
   const absolute = value => {
     try { return normalizeProtocol(new URL(value.trim(), baseUrl)).toString(); } catch { return ''; }
   };
@@ -101,7 +103,6 @@ module.exports = async function handler(req, res) {
     const isPlaylist = /\.m3u8(?:$|\?)/i.test(current.href);
     const isMp4Like = /\.(mp4|m4v|mov|mkv)(?:$|\?)/i.test(current.href);
 
-    // Mantém a lógica de chunk para MP4 (era o que fazia funcionar)
     if (!isPlaylist && isMp4Like) {
       const m = requestedRange && requestedRange.match(/^bytes=(\d+)-(\d*)$/);
       if (requestedRange && !m) return res.status(416).end('Invalid Range.');
@@ -172,6 +173,7 @@ module.exports = async function handler(req, res) {
       }
       res.statusCode = upstream.status === 206 ? 206 : 200;
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+      // NÃO força Accept-Ranges em playlist HLS
       return res.end(rewritePlaylist(body, current, payload.exp));
     }
 
@@ -185,8 +187,7 @@ module.exports = async function handler(req, res) {
       return res.status(502).json({ error: message });
     }
 
-    // Se a origem ignorou o Range e devolveu 200, NÃO trava: apenas transmite.
-    // Isso evita o 502 que você estava vendo.
+    // Para MP4, se a origem ignorar Range, continua transmitindo (não trava)
     if (isMp4Like && range && upstream.status !== 206) {
       res.setHeader('X-Stream-Warning', 'Origin ignorou Range; fallback para stream contínuo.');
     }
