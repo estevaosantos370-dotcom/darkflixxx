@@ -30,8 +30,23 @@ async function assertPublic(url) {
   if (!ips.length || ips.some(x => privateIp(x.address))) throw new Error('Host privado bloqueado.');
 }
 
+function alternateProtocol(url) {
+  const alternate = new URL(url);
+  if (url.protocol === 'http:' && (!url.port || url.port === '80')) {
+    alternate.protocol = 'https:';
+    alternate.port = '';
+    return alternate;
+  }
+  if (url.protocol === 'https:' && (!url.port || url.port === '443')) {
+    alternate.protocol = 'http:';
+    alternate.port = '';
+    return alternate;
+  }
+  return null;
+}
+
 function tokenUrl(url, exp) {
-  return `/api/stream?t=${encodeURIComponent(encode({ url, exp }))}`;
+  return `/api/proxy?t=${encodeURIComponent(encode({ url, exp }))}`;
 }
 
 function rewritePlaylist(text, baseUrl, exp) {
@@ -69,8 +84,9 @@ module.exports = async function handler(req, res) {
     let current = new URL(payload.url);
     const requestedRange = req.headers.range;
     let range = requestedRange;
-    const originalOrigin = current.origin;
-    const originalReferer = current.toString();
+    let originalOrigin = current.origin;
+    let originalReferer = current.toString();
+    let protocolRetryUsed = false;
     const isPlaylist = /\.m3u8(?:$|\?)/i.test(current.href);
     const isMp4Like = /\.(mp4|m4v|mov|mkv)(?:$|\?)/i.test(current.href);
 
@@ -97,7 +113,20 @@ module.exports = async function handler(req, res) {
       };
       if (range) headers.Range = range;
       if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-      upstream = await fetch(current, { method: req.method, headers, redirect: 'manual', signal: controller.signal });
+      try {
+        upstream = await fetch(current, { method: req.method, headers, redirect: 'manual', signal: controller.signal });
+      } catch (error) {
+        if ((error.cause?.code || error.code) !== 'ECONNREFUSED' || protocolRetryUsed) throw error;
+        const alternate = alternateProtocol(current);
+        if (!alternate) throw error;
+        await assertPublic(alternate);
+        protocolRetryUsed = true;
+        current = alternate;
+        originalOrigin = current.origin;
+        originalReferer = current.toString();
+        headers.Referer = originalReferer;
+        upstream = await fetch(current, { method: req.method, headers, redirect: 'manual', signal: controller.signal });
+      }
       if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
       const location = upstream.headers.get('location');
       if (!location) throw new Error('O host de mídia enviou um redirecionamento sem destino.');
