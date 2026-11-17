@@ -3,7 +3,6 @@ const net = require('node:net');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { decode, encode } = require('../lib/stream-token');
-const CHUNK = 4 * 1024 * 1024;
 
 function privateIp(ip) {
   if (net.isIPv4(ip)) {
@@ -66,15 +65,15 @@ function setStreamError(res, message) {
   res.setHeader('Access-Control-Expose-Headers', 'X-Stream-Error, Content-Range, Accept-Ranges');
 }
 
-async function fetchWithRetry(url, options, retries = 1) {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fetch(url, options);
-    } catch (e) {
-      const code = e.cause?.code || e.code;
-      if (attempt >= retries || (code !== 'ECONNRESET' && code !== 'ECONNREFUSED')) throw e;
-      await new Promise(r => setTimeout(r, 400));
-    }
+// Retry simples: apenas para falhas de conexão, no máximo 1 vez
+async function fetchWithOneRetry(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (e) {
+    const code = e.cause?.code || e.code;
+    if (code !== 'ECONNRESET' && code !== 'ECONNREFUSED') throw e;
+    await new Promise(r => setTimeout(r, 500));
+    return await fetch(url, options);
   }
 }
 
@@ -98,17 +97,13 @@ module.exports = async function handler(req, res) {
     const isPlaylist = /\.m3u8(?:$|\?)/i.test(current.href);
     const isMp4Like = /\.(mp4|m4v|mov|mkv)(?:$|\?)/i.test(current.href);
 
-    if (!isPlaylist && isMp4Like) {
-      const m = requestedRange && requestedRange.match(/^bytes=(\d+)-(\d*)$/);
-      if (requestedRange && !m) return res.status(416).end('Invalid Range.');
-      const start = m ? Number(m[1]) : 0;
-      const requestedEnd = m && m[2] ? Number(m[2]) : start + CHUNK - 1;
-      const end = Math.min(requestedEnd, start + CHUNK - 1);
-      range = `bytes=${start}-${end}`;
-    }
+    // Para MP4, se houver Range, não limitamos à força o tamanho do bloco; apenas repassamos
+    // Se o cliente não enviou Range, também não adicionamos artificialmente
+    // Isso evita que a origem ignore Range e cause problemas
 
     controller = new AbortController();
     res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+
     let upstream;
     for (let hops = 0; hops < 6; hops++) {
       await assertPublic(current);
@@ -123,7 +118,11 @@ module.exports = async function handler(req, res) {
       };
       if (range) headers.Range = range;
       if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-      upstream = await fetchWithRetry(current, { method: 'GET', headers, redirect: 'manual', signal: controller.signal });
+
+      upstream = await fetchWithOneRetry(current, {
+        method: 'GET', headers, redirect: 'manual', signal: controller.signal
+      });
+
       if (![301, 302, 303, 307, 308].includes(upstream.status)) break;
       const location = upstream.headers.get('location');
       if (!location) throw new Error('O host de mídia enviou um redirecionamento sem destino.');
@@ -134,13 +133,15 @@ module.exports = async function handler(req, res) {
 
     const type = upstream.headers.get('content-type') || '';
     const playlist = /mpegurl|vnd\.apple\.mpegurl/i.test(type) || /\.m3u8(?:$|\?)/i.test(current.href);
+
+    // Se a origem retornar erro, tentar ler o corpo para dar uma dica (mas não travar)
     if (!upstream.ok && upstream.status !== 206) {
       if (upstream.status === 416) {
         const contentRange = upstream.headers.get('content-range');
         if (contentRange) res.setHeader('Content-Range', contentRange);
         return res.status(416).end();
       }
-      const hint = upstream.status === 401 || upstream.status === 403
+      const hint = (upstream.status === 401 || upstream.status === 403)
         ? ' O provedor recusou as credenciais ou o acesso a este stream.' : '';
       const message = `O host de mídia respondeu HTTP ${upstream.status}.${hint}`;
       setStreamError(res, message);
@@ -177,29 +178,33 @@ module.exports = async function handler(req, res) {
       return res.status(502).json({ error: message });
     }
 
-    // 关键修改：源站忽略 Range 返回 200 时，不再直接报错，而是回退为普通流式传输
-    if (isMp4Like && range && upstream.status !== 206) {
-      res.removeHeader('Accept-Ranges');
-      res.setHeader('X-Stream-Warning', 'Origin ignorou Range; fallback to continuous stream.');
-    }
-
+    // Repassar os headers da origem (incluindo status e content-range)
     res.statusCode = upstream.status;
     for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag']) {
       const value = upstream.headers.get(name);
       if (value) res.setHeader(name, value);
     }
-    if (isMp4Like && upstream.status === 206) res.setHeader('Accept-Ranges', 'bytes');
+    // Não forçar Accept-Ranges; deixar a origem decidir
     if (!upstream.body) return res.end();
+
+    // Transmitir diretamente
     await pipeline(Readable.fromWeb(upstream.body), res);
   } catch (e) {
     if (res.headersSent || res.writableEnded) return;
     const missingSecret = e.message.includes('STREAM_PROXY_SECRET');
     const connection = e.cause?.code || e.code;
-    const message = missingSecret ? e.message : connection === 'ECONNREFUSED'
-      ? 'CONNECTION_REFUSED: a origem recusou a conexão da Vercel. Confirme o host e a porta com o provedor.'
-      : e.name === 'TimeoutError' ? 'O host de mídia não respondeu dentro do tempo limite.'
-      : e.message.includes('Host privado') || e.message.includes('Host local') || e.message.includes('somente origens') ? e.message
-      : 'Não foi possível buscar o stream no provedor.';
+    let message;
+    if (missingSecret) {
+      message = e.message;
+    } else if (connection === 'ECONNREFUSED') {
+      message = 'CONNECTION_REFUSED: a origem recusou a conexão da Vercel. Confirme o host e a porta com o provedor.';
+    } else if (e.name === 'TimeoutError') {
+      message = 'O host de mídia não respondeu dentro do tempo limite.';
+    } else if (e.message.includes('Host privado') || e.message.includes('Host local') || e.message.includes('somente origens')) {
+      message = e.message;
+    } else {
+      message = 'Não foi possível buscar o stream no provedor: ' + (e.message || 'erro desconhecido');
+    }
     setStreamError(res, message);
     return res.status(502).json({ error: message });
   }
