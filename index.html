@@ -126,11 +126,17 @@ async function startPlayer(input){
     hls.on(Hls.Events.ERROR,(_,d)=>{
      if(!d.fatal)return;
      const details=d.details||'erro HLS',status=d.response?.code||d.networkDetails?.status||'',type=d.type||'erro';
+     // Erro de mídia: tenta recuperar o decodificador uma vez
      if(d.type===Hls.ErrorTypes.MEDIA_ERROR&&mediaRecoveries<1){mediaRecoveries++;$('playerMsg').textContent=`Recuperando decodificador HLS após ${details}…`;hls.recoverMediaError();return}
+     // Erro de rede: tenta reconectar até 2 vezes antes de mudar de formato
      if(d.type===Hls.ErrorTypes.NETWORK_ERROR&&networkRecoveries<2){networkRecoveries++;$('playerMsg').textContent=`Falha de rede HLS (${details}${status?`, HTTP ${status}`:''}); tentando reconectar (${networkRecoveries}/2)…`;setTimeout(()=>{if(requestId===playerRequestId&&hls)hls.startLoad(-1)},800*networkRecoveries);return}
      const reason=`HLS falhou: ${details}${status?` (HTTP ${status})`:''}.`;
      if(fallbackVariant(reason))return;
-     $('playerMsg').textContent=`${reason} Todos os formatos alternativos foram tentados. ${type==='mediaError'?'O navegador recebeu mídia, mas não decodificou; codec/perfil de vídeo pode ser incompatível.':'Confira o diagnóstico do proxy ou a disponibilidade do stream.'}`;
+     // Mensagem final diferenciando rede de codec
+     const isNetwork = d.type===Hls.ErrorTypes.NETWORK_ERROR;
+     $('playerMsg').textContent = isNetwork
+       ? `${reason} O proxy não conseguiu acessar o servidor de origem; verifique se o provedor bloqueia IPs da Vercel ou se a porta está correta.`
+       : `${reason} O navegador recebeu mídia, mas não decodificou; codec/perfil de vídeo pode ser incompatível.`;
      const failedUrl=d.response?.url||d.url||d.context?.url;
      proxyDiagnostic(failedUrl).then(msg=>{if(msg&&requestId===playerRequestId)$('playerMsg').textContent=`${reason} ${msg}`});
     });
@@ -140,7 +146,11 @@ async function startPlayer(input){
    }else throw Error('Este navegador não tem suporte a HLS.js nem a HLS nativo.')
   }else{v.src=url;v.play().catch(()=>{$('playerMsg').textContent=`Stream ${spec.ext.toUpperCase()} conectado. Pressione reproduzir para iniciar.`})}
   v.onerror=()=>{
-   const label=mediaErrorLabel(v),message=`${spec.ext.toUpperCase()}: ${label}.`;
+   const label=mediaErrorLabel(v);
+   const isNetwork=v.error?.code===2;
+   const message=isNetwork
+     ? `Erro de rede: ${label}. O servidor de origem pode estar bloqueando a conexão do proxy.`
+     : `${spec.ext.toUpperCase()}: ${label}.`;
    if(fallbackVariant(message))return;
    $('playerMsg').textContent=`${message} Todas as variantes foram tentadas. Se o proxy entregou os dados, o vídeo pode usar codec/perfil não suportado pelo navegador.`;
    proxyDiagnostic(url).then(reason=>{if(reason&&requestId===playerRequestId)$('playerMsg').textContent=`${message} ${reason}`})
