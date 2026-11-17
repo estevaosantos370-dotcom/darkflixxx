@@ -1,5 +1,6 @@
 const dns = require('node:dns/promises');
 const net = require('node:net');
+const { encode } = require('../lib/stream-token');
 
 const ALLOWED = new Set([
   'get_user_info', 'get_vod_categories', 'get_vod_streams', 'get_vod_info',
@@ -21,14 +22,38 @@ function isPrivate(ip) {
   return true;
 }
 
+function proxyImageUrls(value) {
+  if (Array.isArray(value)) return value.map(proxyImageUrls);
+  if (!value || typeof value !== 'object') return value;
+  for (const [name, item] of Object.entries(value)) {
+    if (typeof item === 'string' && /(?:icon|cover|image|poster|logo|backdrop)/i.test(name) && /^https?:\/\//i.test(item)) {
+      try {
+        const image = new URL(item);
+        if (!image.username && !image.password) {
+          const token = encode({ url: image.toString(), exp: Date.now() + 2 * 60 * 60 * 1000 });
+          value[name] = `/api/stream?t=${encodeURIComponent(token)}`;
+        }
+      } catch {}
+    } else if (item && typeof item === 'object') {
+      value[name] = proxyImageUrls(item);
+    }
+  }
+  return value;
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
   try {
-    const { host, username, password, action, series_id, vod_id } = req.body || {};
-    if (typeof host !== 'string' || typeof username !== 'string' || typeof password !== 'string' || typeof action !== 'string')
-      return res.status(400).json({ error: 'Informe endereço, usuário, senha e ação.' });
+    const { series_id, vod_id } = req.body || {};
+    const action = req.body?.action;
+    const host = process.env.XTREAM_HOST;
+    const username = process.env.XTREAM_USERNAME;
+    const password = process.env.XTREAM_PASSWORD;
+    if (!host || !username || !password)
+      return res.status(503).json({ error: 'Conexão não configurada: cadastre XTREAM_HOST, XTREAM_USERNAME e XTREAM_PASSWORD nas variáveis privadas da Vercel.' });
+    if (typeof action !== 'string') return res.status(400).json({ error: 'Ação inválida.' });
     if (!ALLOWED.has(action)) return res.status(400).json({ error: 'Ação não permitida.' });
     if ((series_id !== undefined && !/^\d{1,20}$/.test(String(series_id))) ||
         (vod_id !== undefined && !/^\d{1,20}$/.test(String(vod_id))))
@@ -57,9 +82,11 @@ module.exports = async function handler(req, res) {
     if (!upstream.ok) return res.status(502).json({ error: `O provedor respondeu HTTP ${upstream.status}.` });
     let data;
     try { data = JSON.parse(text); } catch { return res.status(502).json({ error: 'Resposta inválida do provedor. Confirme o endereço e as credenciais.' }); }
-    return res.status(200).json({ data });
+    return res.status(200).json({ data: proxyImageUrls(data) });
   } catch (e) {
-    const message = e.name === 'TimeoutError' ? 'Tempo esgotado ao conectar ao provedor.' : 'Não foi possível conectar. Confira o endereço, a rede e as credenciais.';
+    const message = e.message.includes('STREAM_PROXY_SECRET') ? e.message :
+      e.cause?.code === 'ECONNREFUSED' || e.code === 'ECONNREFUSED' ? 'CONNECTION_REFUSED: o host do catálogo recusou a conexão a partir da Vercel. Confirme o endereço e a porta com o provedor.' :
+      e.name === 'TimeoutError' ? 'Tempo esgotado ao conectar ao provedor.' : 'Não foi possível conectar. Confira as variáveis privadas e o endereço do provedor.';
     return res.status(502).json({ error: message });
   }
 };
