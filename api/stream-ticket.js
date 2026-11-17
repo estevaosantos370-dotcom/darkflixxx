@@ -16,9 +16,18 @@ function privateIp(ip) {
   }
   return true;
 }
+
+function forceHttp(value) {
+  const url = new URL(value);
+  if (url.protocol === 'https:') {
+    url.protocol = 'http:';
+    if (url.port === '443') url.port = '';
+  }
+  if (url.protocol !== 'http:') throw new Error('XTREAM_HOST precisa usar HTTP.');
+  return url;
+}
+
 async function assertPublic(url) {
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password)
-    throw new Error('URL do servidor de mídia inválida.');
   const host = url.hostname.toLowerCase();
   if (host === 'localhost' || host.endsWith('.local')) throw new Error('Host local não permitido.');
   const ips = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
@@ -28,22 +37,24 @@ async function assertPublic(url) {
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Accept, Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Este endpoint usa somente GET.' });
   try {
-    const { kind, id, ext } = req.body || {};
+    const { kind, id, ext } = req.query || {};
     const host = process.env.XTREAM_HOST;
     const username = process.env.XTREAM_USERNAME;
     const password = process.env.XTREAM_PASSWORD;
     if (!host || !username || !password)
       return res.status(503).json({ error: 'Conexão não configurada: cadastre XTREAM_HOST, XTREAM_USERNAME e XTREAM_PASSWORD nas variáveis privadas da Vercel.' });
-    if (![kind, id, ext].every(x => typeof x === 'string'))
-      return res.status(400).json({ error: 'Dados do stream incompletos.' });
+    if (![kind, id, ext].every(x => typeof x === 'string')) return res.status(400).json({ error: 'Dados do stream incompletos.' });
     if (!['movie', 'series', 'live'].includes(kind) || !/^\d{1,20}$/.test(id) || !/^[a-zA-Z0-9]{1,10}$/.test(ext))
       return res.status(400).json({ error: 'Tipo, ID ou formato do stream inválido.' });
-    if (host.length > 400 || username.length > 180 || password.length > 180)
-      return res.status(400).json({ error: 'Campo excede o limite permitido.' });
-    const base = new URL(host.trim());
-    if (base.search || base.hash) return res.status(400).json({ error: 'Informe apenas o endereço base do provedor.' });
+    if (host.length > 400 || username.length > 180 || password.length > 180) return res.status(400).json({ error: 'Campo excede o limite permitido.' });
+    const base = forceHttp(host.trim());
+    if (base.search || base.hash || base.username || base.password) return res.status(400).json({ error: 'Informe somente o endereço-base HTTP do provedor.' });
     await assertPublic(base);
     const prefix = base.pathname.replace(/\/$/, '');
     base.pathname = `${prefix}/${kind}/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.${ext}`;
@@ -51,7 +62,8 @@ module.exports = async function handler(req, res) {
     const token = encode({ url: base.toString(), exp: Date.now() + 2 * 60 * 60 * 1000 });
     return res.status(200).json({ url: `/api/proxy?t=${encodeURIComponent(token)}` });
   } catch (e) {
-    const message = e.message.includes('STREAM_PROXY_SECRET') ? e.message : 'Não foi possível preparar o stream. Verifique a conexão com o host do provedor.';
+    const message = e.message.includes('STREAM_PROXY_SECRET') || e.message.includes('HTTP') ? e.message :
+      'Não foi possível preparar o stream HTTP. Verifique o host/porta e as variáveis privadas da Vercel.';
     return res.status(502).json({ error: message });
   }
 };
