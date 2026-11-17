@@ -8,7 +8,64 @@
 <div id="modal" class="modal hidden" onclick="if(event.target===this)closeModal()"><div id="modalContent" class="modalbox"></div></div>
 <script>
 const PROFILE_KEY='darkflix_profiles_v2',FAV_KEY='darkflix_favorites_v2',RECENT_KEY='darkflix_recent_v2';let profile=null,items=[],categories={filmes:[],series:[],canais:[]},page='inicio',selectedCategory='all',hls=null,loadSeq=0,seriesEpisodeCache={},loadedTypes={filmes:false,series:false,canais:false},pendingTypes={},visibleCount=30,scrollObserver=null;const $=id=>document.getElementById(id);function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function read(key,def){try{return JSON.parse(localStorage.getItem(key))??def}catch{return def}}function write(key,val){localStorage.setItem(key,JSON.stringify(val))}
-async function responseJson(r,label){const text=await r.text();try{return JSON.parse(text)}catch{const sample=text.replace(/\s+/g,' ').slice(0,100);throw Error(`${label} respondeu conteúdo não JSON (HTTP ${r.status}): ${sample}`)}}async function api(action,extra={}){const params=new URLSearchParams({action,...Object.fromEntries(Object.entries(extra).map(([k,v])=>[k,String(v)]))});const r=await fetch(`/api/xtream?${params}`,{method:'GET',headers:{Accept:'application/json'},cache:'no-store'});const j=await responseJson(r,'/api/xtream');if(!r.ok)throw Error(j.error||'Falha ao consultar o provedor.');return j.data}
+async function responseJson(r,label){const text=await r.text();try{return JSON.parse(text)}catch{const sample=text.replace(/\s+/g,' ').slice(0,100);throw Error(`${label} respondeu conteúdo não JSON (HTTP ${r.status}): ${sample}`)}}
+
+/* ---------- CONEXÃO DIRETA + FALLBACK PARA PROXY ---------- */
+let XTREAM_BASE_HOST = null;
+
+async function loadXtreamHost() {
+  if (XTREAM_BASE_HOST) return XTREAM_BASE_HOST;
+  try {
+    const r = await fetch('/api/config', { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      XTREAM_BASE_HOST = j.host || null;
+    }
+  } catch {}
+  return XTREAM_BASE_HOST;
+}
+
+async function api(action, extra = {}) {
+  const params = new URLSearchParams({
+    action,
+    ...Object.fromEntries(Object.entries(extra).map(([k, v]) => [k, String(v)]))
+  });
+
+  // 1) Tenta conexão DIRETA ao servidor Xtream (como o HTML de referência)
+  const baseHost = await loadXtreamHost();
+  if (baseHost) {
+    try {
+      const directUrl = `${baseHost}/player_api.php?${params}`;
+      const r = await fetch(directUrl, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(12000)
+      });
+      if (r.ok) {
+        const text = await r.text();
+        let j;
+        try { j = JSON.parse(text); } catch { j = null; }
+        if (j && (Array.isArray(j) ? j.length >= 0 : Object.keys(j).length > 0)) {
+          return j;
+        }
+      }
+    } catch (e) {
+      console.warn('Conexão direta falhou, usando proxy:', e.message);
+    }
+  }
+
+  // 2) Fallback: proxy da Vercel
+  const r = await fetch(`/api/xtream?${params}`, {
+    method: 'GET',
+    headers: { 'Accept': 'application/json' },
+    cache: 'no-store'
+  });
+  const j = await responseJson(r, '/api/xtream');
+  if (!r.ok) throw Error(j.error || 'Falha ao consultar o provedor.');
+  return j.data;
+}
+
 function getProfiles(){return read(PROFILE_KEY,[])}function showProfiles(){$('app').classList.add('hidden');$('profileScreen').classList.remove('hidden');let ps=getProfiles();if(!ps.length){ps=[{id:'p'+Date.now(),name:'Principal',avatar:'👤'}];write(PROFILE_KEY,ps)}$('profiles').innerHTML=ps.map(p=>`<div class="profile" onclick="selectProfile('${esc(p.id)}')"><div class="avatar">${esc(p.avatar||'👤')}</div><div class="pname">${esc(p.name)}</div><button class="outline" onclick="event.stopPropagation();removeProfile('${esc(p.id)}')">Editar/remover</button></div>`).join('')}function selectProfile(id){profile=getProfiles().find(p=>p.id===id);if(!profile)return;$('profileScreen').classList.add('hidden');$('app').classList.remove('hidden');$('accountPill').textContent=profile.name;setPage('inicio');loadCatalog()}function addProfile(){let ps=getProfiles();if(ps.length>=6)return alert('Limite de 6 perfis locais atingido.');let name=prompt('Nome do novo perfil:');if(name?.trim()){ps.push({id:'p'+Date.now(),name:name.trim(),avatar:['👤','🎬','⭐','🐼','🦊'][ps.length%5]});write(PROFILE_KEY,ps);showProfiles()}}function removeProfile(id){let ps=getProfiles(),p=ps.find(x=>x.id===id);if(!p)return;const name=prompt('Digite um novo nome para editar o perfil, ou deixe vazio para remover:',p.name);if(name===null)return;if(name.trim())p.name=name.trim();else{if(ps.length<=1)return alert('Mantenha pelo menos um perfil.');ps=ps.filter(x=>x.id!==id)}write(PROFILE_KEY,ps);showProfiles()}
 const catalogActions={filmes:['get_vod_streams','get_vod_categories'],series:['get_series','get_series_categories'],canais:['get_live_streams','get_live_categories']};async function loadCatalog(type=pageType()||'filmes'){if(!type){const required=page==='favoritos'||page==='recentes'?['filmes','series','canais']:['filmes'];return Promise.all(required.map(t=>loadCatalog(t).catch(()=>null)))}if(loadedTypes[type]){render();return}if(pendingTypes[type])return pendingTypes[type];if(page==='inicio'&&type==='filmes'||pageType()===type)$('main').innerHTML='<div class="wrap loading">Carregando catálogo…</div>';pendingTypes[type]=(async()=>{const [list,cats]=await Promise.all(catalogActions[type].map(a=>api(a)));items=items.filter(x=>x.type!==type).concat(normalize(list,type));categories[type]=Array.isArray(cats)?cats:[];loadedTypes[type]=true;render()})().catch(e=>{if(page==='inicio'&&type==='filmes'||pageType()===type)showStatus(e.message,'err');throw e}).finally(()=>{delete pendingTypes[type]});return pendingTypes[type]}function normalize(list,type){return Array.isArray(list)?list.map(o=>({id:String(o.stream_id??o.series_id),name:o.name||o.title||'Sem título',type,year:o.year||o.releaseDate||'',genre:o.category_name||o.genre||'',categoryId:String(o.category_id??''),cover:o.stream_icon||o.cover||'',streamId:o.stream_id??o.series_id,ext:o.container_extension||(type==='canais'?'ts':'mp4'),plot:o.plot||'',rating:o.rating||''})).filter(o=>/^\d{1,20}$/.test(o.id)):[]}
 function setPage(p){page=p;selectedCategory='all';visibleCount=30;$('search').value='';document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('sel',b.dataset.p===p));const type=pageType();if(type&&!loadedTypes[type])loadCatalog(type).catch(()=>{});else if(!type&&(p==='favoritos'||p==='recentes'))loadCatalog(null).catch(()=>{});render()}function pageType(){return({filmes:'filmes',series:'series',canais:'canais'})[page]}function searchChanged(){visibleCount=30;const q=$('search').value.trim();if(q&&page==='inicio')Promise.all(['series','canais'].map(t=>loadedTypes[t]?Promise.resolve():loadCatalog(t).catch(()=>null)));render()}function render(){if($('app').classList.contains('hidden'))return;let q=$('search').value.trim().toLowerCase(),type=pageType();let list=items.filter(x=>{const match=!q||x.name.toLowerCase().includes(q)||String(x.genre).toLowerCase().includes(q);const typed=!type||x.type===type;const category=selectedCategory==='all'||x.categoryId===selectedCategory;const localList=page==='favoritos'?isFavorite(x):page==='recentes'?isRecent(x):true;return match&&typed&&category&&localList});let hero=page==='inicio'?`<section class="hero"><div><h1>Seu entretenimento.<br>Do seu jeito.</h1><p>Filmes, séries e canais carregados diretamente da sua conta.</p><button class="red" onclick="setPage('filmes')">▶ Explorar filmes</button> <button class="outline" onclick="setPage('canais')">Ver canais ao vivo</button></div></section>`:'';let title={inicio:'Catálogo',filmes:'Filmes',series:'Séries',canais:'Canais ao vivo',favoritos:'Minha lista',recentes:'Continuar assistindo'}[page];let tools=type?`<div class="toolbar"><label>Categoria <select id="categoryFilter" onchange="selectedCategory=this.value;visibleCount=30;render()"><option value="all">Todas</option>${categories[type].map(c=>`<option value="${esc(c.category_id)}" ${String(c.category_id)===selectedCategory?'selected':''}>${esc(c.category_name)}</option>`).join('')}</select></label><span class="muted">${list.length} título(s)</span></div>`:'';const shown=list.slice(0,visibleCount);$('main').innerHTML=hero+`<div class="wrap"><h2 class="section-title">${title}</h2>${tools}<div class="grid">${shown.map(card).join('')||'<p class="empty">Nenhum título nesta lista/categoria.</p>'}</div>${shown.length<list.length?'<div id="loadMoreSentinel" class="loading" style="text-align:center">Carregando mais títulos ao rolar…</div>':''}</div>`;observeMore()}function observeMore(){if(scrollObserver)scrollObserver.disconnect();const el=$('loadMoreSentinel');if(!el)return;if('IntersectionObserver'in window){scrollObserver=new IntersectionObserver(entries=>{if(entries.some(e=>e.isIntersecting))loadMore()}, {rootMargin:'500px'});scrollObserver.observe(el)}else window.addEventListener('scroll',fallbackLoadMore,{passive:true})}function loadMore(){const el=$('loadMoreSentinel');if(!el)return;visibleCount+=30;render()}function fallbackLoadMore(){const el=$('loadMoreSentinel');if(el&&el.getBoundingClientRect().top<window.innerHeight+500){window.removeEventListener('scroll',fallbackLoadMore);loadMore()}}function card(x){return `<article class="card" onclick="details('${esc(x.id)}')"><div class="poster" style="${x.cover?`background-image:linear-gradient(0deg,#0008,transparent 60%),url('${esc(x.cover)}')`:''}"><i class="badge">${x.type==='canais'?'AO VIVO':x.type==='series'?'SÉRIE':'FILME'}</i>${isFavorite(x)?'<span class="favorite-mark">♥</span>':''}${x.cover?'':`<b>${esc(x.name)}</b>`}</div><div class="info"><strong>${esc(x.name)}</strong><span class="muted">${esc(x.genre)}${x.year?' · '+esc(x.year):''}</span></div></article>`}
@@ -94,10 +151,8 @@ function playItem(id){
   const kind=x.type==='filmes'?'movie':x.type==='series'?'series':'live';
   let formats;
   if(kind==='live'){
-    // Canal ao vivo: SOMENTE m3u8 (fallback = reconectar m3u8)
     formats=['m3u8','m3u8'];
   }else{
-    // Filmes/séries: MP4 primeiro, m3u8 como alternativa
     const original=(x.ext||'mp4').toLowerCase();
     formats=original==='m3u8'?['m3u8','mp4']:['mp4','m3u8'];
   }
@@ -191,13 +246,11 @@ async function startPlayer(input){
           }
 
           const reason=`HLS falhou: ${details}${status?` (HTTP ${status})`:''}.`;
-          // Canal ao vivo: tenta reconectar o mesmo M3U8 (fallback de variante)
           if(isLive){
             if(fallbackVariant(reason))return;
             $('playerMsg').textContent=`${reason} Não foi possível reconectar o canal ao vivo. O provedor pode estar limitando conexões simultâneas.`;
             return
           }
-          // Filme/série: tenta próxima variante (m3u8 -> mp4 ou vice-versa)
           if(fallbackVariant(reason))return;
           $('playerMsg').textContent=`${reason} Todas as variantes foram tentadas.`;
           const failedUrl=d.response?.url||d.url||d.context?.url;
@@ -218,7 +271,6 @@ async function startPlayer(input){
       const message=isNetwork
         ? `Erro de rede: ${label}.`
         : `${spec.ext.toUpperCase()}: ${label}.`;
-      // Canal ao vivo: não troca para TS/MP4; tenta reconectar o m3u8
       if(isLive){
         if(fallbackVariant(message))return;
         $('playerMsg').textContent=`${message} Não foi possível reconectar.`;
