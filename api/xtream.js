@@ -57,6 +57,18 @@ function proxyImageUrls(value) {
   return value;
 }
 
+async function fetchWithRetry(url, options, retries = 2) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (e) {
+      const code = e.cause?.code || e.code;
+      if (attempt >= retries || (code !== 'ECONNRESET' && code !== 'ECONNREFUSED')) throw e;
+      await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+    }
+  }
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
@@ -93,8 +105,8 @@ module.exports = async function handler(req, res) {
     let upstream;
     for (let hop = 0; hop < 6; hop++) {
       await assertPublic(url);
-      upstream = await fetch(url, {
-        method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(18000),
+      upstream = await fetchWithRetry(url, {
+        method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(12000),
         headers: {
           'User-Agent': process.env.XTREAM_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           Accept: 'application/json, */*',
