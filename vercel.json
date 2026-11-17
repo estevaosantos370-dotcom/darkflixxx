@@ -1,5 +1,6 @@
 {
   "functions": {
-    "api/xtream.js": { "maxDuration": 30 }
+    "api/xtream.js": { "maxDuration": 30 },
+    "api/stream.js": { "maxDuration": 300 }
   }
 }
