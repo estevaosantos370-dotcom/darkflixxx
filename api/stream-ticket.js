@@ -56,7 +56,8 @@ module.exports = async function handler(req, res) {
     const prefix = base.pathname.replace(/\/$/, '');
     base.pathname = `${prefix}/${kind}/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.${ext}`;
     base.search = '';
-    const token = encode({ url: base.toString(), exp: Date.now() + 2 * 60 * 60 * 1000 });
+    // 6 horas de validade para cobrir reproduções longas
+    const token = encode({ url: base.toString(), exp: Date.now() + 6 * 60 * 60 * 1000 });
     return res.status(200).json({ url: `/api/proxy?t=${encodeURIComponent(token)}` });
   } catch (e) {
     const message = e.message.includes('STREAM_PROXY_SECRET') || e.message.includes('HTTP') ? e.message :
